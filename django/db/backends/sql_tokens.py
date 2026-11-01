@@ -87,15 +87,12 @@ _TXN_WORDS = {
 _END_QUALIFIERS = {"IF", "FOR", "WHILE", "LOOP", "CASE"}
 
 
-def split_statements(sql):
+def _split_on_semicolons(sql):
     """
-    Split a script into statements on top-level semicolons. Comments are
-    replaced by a space and statements are stripped; empty ones are skipped.
-
-    Semicolons inside parentheses or inside BEGIN ... END blocks (triggers,
-    stored routines, anonymous blocks) don't end a statement. As in sqlparse,
-    a backslash escapes a quote inside single-quoted strings. DELIMITER, GO and
-    a lone "/" terminator aren't supported.
+    Split on top-level semicolons. Semicolons inside parentheses or inside
+    BEGIN ... END blocks (triggers, stored routines, anonymous blocks) don't
+    end a statement. As in sqlparse, a backslash escapes a quote inside
+    single-quoted strings.
     """
     toks = list(tokenize(sql))
     sig = [i for i, tk in enumerate(toks) if tk.kind not in (WHITESPACE, COMMENT)]
@@ -173,6 +170,97 @@ def split_statements(sql):
                     stack.pop()
     statements.append("".join(current))
     return [x.strip() for x in statements if x.strip()]
+
+
+_CLIENT_COMMAND_RE = re.compile(r"\b(?:DELIMITER|GO)\b", re.IGNORECASE)
+_DELIMITER_COMMAND_RE = re.compile(
+    r"DELIMITER[ \t]+([^\s'\"`\\]+)[ \t]*(?:\r?\n|\Z)", re.IGNORECASE
+)
+_GO_COMMAND_RE = re.compile(
+    r"GO(?:[ \t]+\d+)?[ \t]*(?:--[^\n]*)?(?:\r?\n|\Z)", re.IGNORECASE
+)
+
+
+def _strip_comments(text):
+    text = "".join(
+        " " if token.kind == COMMENT else token.value for token in tokenize(text)
+    ).strip()
+    return [text] if text else []
+
+
+def split_statements(sql):
+    """
+    Split a script into statements. Comments are replaced by a space and
+    statements are stripped; empty ones are skipped.
+
+    Statements end at top-level semicolons (see _split_on_semicolons()). Two
+    client commands are also understood, and aren't part of the output:
+
+    * "DELIMITER x" on its own line at the start of a statement (MySQL client):
+      statements then end at "x" instead of ";", which is removed.
+    * "GO" or "GO n" alone on a line, outside parentheses (SQL Server
+      sqlcmd): it ends the current batch. The repeat count is ignored.
+
+    A lone "/" terminator (Oracle) isn't supported.
+    """
+    if not _CLIENT_COMMAND_RE.search(sql):
+        return _split_on_semicolons(sql)
+    statements = []
+    delimiter = ";"
+    pos = chunk_start = 0
+    level = 0
+    at_start = line_start = True
+
+    def flush(end):
+        if delimiter == ";":
+            statements.extend(_split_on_semicolons(sql[chunk_start:end]))
+        else:
+            statements.extend(_strip_comments(sql[chunk_start:end]))
+
+    while pos < len(sql):
+        if delimiter != ";" and sql.startswith(delimiter, pos):
+            flush(pos)
+            pos = chunk_start = pos + len(delimiter)
+            at_start, line_start = True, False
+            continue
+        match = _TOKEN_RE.match(sql, pos)
+        value = match.group()
+        kind = match.lastgroup
+        if kind == WHITESPACE:
+            line_start = line_start or "\n" in value
+            pos = match.end()
+            continue
+        if kind == COMMENT:
+            line_start = False
+            pos = match.end()
+            continue
+        command = None
+        if kind == WORD and line_start:
+            upper = value.upper()
+            if upper == "DELIMITER" and at_start:
+                command = _DELIMITER_COMMAND_RE.match(sql, pos)
+            elif upper == "GO" and delimiter == ";" and level == 0:
+                command = _GO_COMMAND_RE.match(sql, pos)
+        if command:
+            flush(pos)
+            if value.upper() == "DELIMITER":
+                delimiter = command.group(1)
+            pos = chunk_start = command.end()
+            level = 0
+            at_start = line_start = True
+            continue
+        line_start = False
+        at_start = False
+        if kind == PUNCTUATION:
+            if value == "(":
+                level += 1
+            elif value == ")":
+                level = max(0, level - 1)
+            elif value == ";" and level == 0:
+                at_start = True
+        pos = match.end()
+    flush(len(sql))
+    return statements
 
 
 _CLAUSE_KEYWORDS = frozenset(

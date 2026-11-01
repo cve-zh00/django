@@ -88,6 +88,53 @@ class SplitStatementsTests(SimpleTestCase):
             with self.subTest(sql=sql[:5]):
                 sql_tokens.split_statements(sql)
 
+    def test_delimiter_command(self):
+        sql = (
+            "DELIMITER //\nCREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END//\n"
+            "DELIMITER ;\nSELECT 3;"
+        )
+        self.assertEqual(
+            sql_tokens.split_statements(sql),
+            ["CREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END", "SELECT 3;"],
+        )
+
+    def test_delimiter_command_dollar_signs(self):
+        sql = "DELIMITER $$\nSELECT 'a;b'$$\nSELECT 2 -- c$$\n$$\nDELIMITER ;\nSELECT 3"
+        self.assertEqual(
+            sql_tokens.split_statements(sql), ["SELECT 'a;b'", "SELECT 2", "SELECT 3"]
+        )
+
+    def test_delimiter_as_identifier(self):
+        sql = "CREATE TABLE t (\n  delimiter text,\n  x int\n); SELECT delimiter FROM t"
+        self.assertEqual(
+            sql_tokens.split_statements(sql),
+            [
+                "CREATE TABLE t (\n  delimiter text,\n  x int\n);",
+                "SELECT delimiter FROM t",
+            ],
+        )
+
+    def test_go_batch_separator(self):
+        self.assertEqual(
+            sql_tokens.split_statements(
+                "SELECT 1\nGO\nSELECT 2\n  go 5 -- x\nSELECT 3"
+            ),
+            ["SELECT 1", "SELECT 2", "SELECT 3"],
+        )
+
+    def test_go_not_a_separator(self):
+        for sql in [
+            "SELECT go FROM t; SELECT 2",
+            "SELECT (\n go\n) FROM t",
+            "SELECT 'a\nGO\nb'",
+            "/* a\nGO\n*/ SELECT 1",
+        ]:
+            with self.subTest(sql=sql):
+                self.assertEqual(
+                    sql_tokens.split_statements(sql),
+                    sql_tokens._split_on_semicolons(sql),
+                )
+
     def test_empty(self):
         self.assertEqual(sql_tokens.split_statements(" ;; \n"), [";", ";"])
 
