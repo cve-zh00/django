@@ -23,8 +23,8 @@ Token = namedtuple("Token", ["kind", "value"])
 _TOKEN_RE = re.compile(
     r"""
       (?P<whitespace>\s+)
-    | (?P<comment>--[^\n]*|/\*.*?(?:\*/|\Z))
-    | (?P<string>'(?:[^']|'')*(?:'|\Z))
+    | (?P<comment>(?:--|\#(?=\s|$))[^\n]*|/\*.*?(?:\*/|\Z))
+    | (?P<string>'(?:''|\\'|[^'])*'|'[^']*\Z)
     | (?P<dollar>\$(?P<tag>[^\W\d]\w*|)\$.*?(?:\$(?P=tag)\$|\Z))
     | (?P<quoted_name>"(?:[^"]|"")*(?:"|\Z)|`(?:[^`]|``)*(?:`|\Z)|\[[^\]]*(?:\]|\Z))
     | (?P<number>\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)
@@ -75,24 +75,104 @@ def name_value(token):
     return None
 
 
+_TXN_WORDS = {
+    "TRANSACTION",
+    "WORK",
+    "TRAN",
+    "DISTRIBUTED",
+    "DEFERRED",
+    "IMMEDIATE",
+    "EXCLUSIVE",
+}
+_END_QUALIFIERS = {"IF", "FOR", "WHILE", "LOOP", "CASE"}
+
+
 def split_statements(sql):
     """
     Split a script into statements on top-level semicolons. Comments are
-    removed and statements are stripped; empty statements are skipped.
+    replaced by a space and statements are stripped; empty ones are skipped.
+
+    Semicolons inside parentheses or inside BEGIN ... END blocks (triggers,
+    stored routines, anonymous blocks) don't end a statement. As in sqlparse,
+    a backslash escapes a quote inside single-quoted strings. DELIMITER, GO and
+    a lone "/" terminator aren't supported.
     """
-    statements = []
-    current = []
-    for token in tokenize(sql):
-        if token.kind == COMMENT:
+    toks = list(tokenize(sql))
+    sig = [i for i, tk in enumerate(toks) if tk.kind not in (WHITESPACE, COMMENT)]
+    pos = {ti: n for n, ti in enumerate(sig)}
+
+    def next_word(ti):
+        n = pos.get(ti)
+        if n is None or n + 1 >= len(sig):
+            return None
+        tk = toks[sig[n + 1]]
+        return (
+            tk.value.upper()
+            if tk.kind == WORD
+            else (";" if is_punctuation(tk, ";") else None)
+        )
+
+    statements, current = [], []
+    stack, level, is_create, unconfirmed = [], 0, False, None
+    closing = False
+    for ti, tk in enumerate(toks):
+        if tk.kind == COMMENT:
             current.append(" ")
-        elif is_punctuation(token, ";"):
-            current.append(token.value)
-            statements.append("".join(current))
-            current = []
-        else:
-            current.append(token.value)
+            continue
+        current.append(tk.value)
+        if tk.kind == PUNCTUATION:
+            if tk.value == "(":
+                level += 1
+            elif tk.value == ")":
+                level = max(0, level - 1)
+            elif tk.value == ";":
+                unconfirmed = None
+                if level <= 0 and not stack:
+                    statements.append("".join(current))
+                    current = []
+                    stack, level, is_create = [], 0, False
+            continue
+        if tk.kind != WORD:
+            continue
+        w = tk.value.upper()
+        if closing:
+            # The IF/LOOP/... in "END IF" closes a block, it doesn't open one.
+            closing = False
+            if w in _END_QUALIFIERS:
+                continue
+        if w == "CREATE":
+            is_create = True
+        elif w == "DECLARE" and is_create and not stack:
+            stack.append("DECLARE")
+        elif w == "BEGIN":
+            nw = next_word(ti)
+            if nw == ";" or nw in _TXN_WORDS:
+                continue
+            if stack and stack[-1] == "DECLARE":
+                stack[-1] = "BEGIN"
+            else:
+                stack.append("BEGIN")
+        elif "BEGIN" in stack:
+            if w in ("FOR", "WHILE"):
+                unconfirmed = w
+            elif w in ("LOOP", "DO") and (unconfirmed or w == "LOOP"):
+                stack.append(unconfirmed or "LOOP")
+                unconfirmed = None
+            elif w in ("IF", "CASE"):
+                stack.append(w)
+            elif w == "END":
+                nw = next_word(ti)
+                if nw in _END_QUALIFIERS:
+                    closing = True
+                    if stack and (
+                        stack[-1] == nw
+                        or (nw == "LOOP" and stack[-1] in ("FOR", "WHILE"))
+                    ):
+                        stack.pop()
+                elif stack:
+                    stack.pop()
     statements.append("".join(current))
-    return [statement.strip() for statement in statements if statement.strip()]
+    return [x.strip() for x in statements if x.strip()]
 
 
 _CLAUSE_KEYWORDS = frozenset(

@@ -314,6 +314,31 @@ class LastExecutedQueryTest(TestCase):
 
 
 @unittest.skipUnless(connection.vendor == "sqlite", "SQLite tests")
+class PrepareSQLScriptTests(TransactionTestCase):
+    available_apps = ["backends"]
+
+    def test_trigger_script_executes(self):
+        script = """
+            CREATE TABLE ps_a (id integer);  -- a; comment
+            CREATE TABLE ps_log (msg text);
+            CREATE TRIGGER ps_t AFTER INSERT ON ps_a BEGIN
+                INSERT INTO ps_log VALUES ('one;two');
+                INSERT INTO ps_log VALUES ('three');
+            END;
+            INSERT INTO ps_a VALUES (1);
+        """
+        with connection.cursor() as cursor:
+            try:
+                for statement in connection.ops.prepare_sql_script(script):
+                    cursor.execute(statement)
+                cursor.execute("SELECT msg FROM ps_log ORDER BY rowid")
+                self.assertEqual(cursor.fetchall(), [("one;two",), ("three",)])
+            finally:
+                cursor.execute("DROP TABLE IF EXISTS ps_log")
+                cursor.execute("DROP TABLE IF EXISTS ps_a")
+
+
+@unittest.skipUnless(connection.vendor == "sqlite", "SQLite tests")
 class EscapingChecks(TestCase):
     """
     All tests in this test case are also run with settings.DEBUG=True in

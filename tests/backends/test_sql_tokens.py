@@ -26,6 +26,68 @@ class SplitStatementsTests(SimpleTestCase):
     def test_unterminated_string(self):
         self.assertEqual(sql_tokens.split_statements("SELECT 'a;b"), ["SELECT 'a;b"])
 
+    def test_trigger_body_not_split(self):
+        sql = "CREATE TRIGGER t AFTER INSERT ON a BEGIN UPDATE b SET x = 1; END;"
+        self.assertEqual(
+            sql_tokens.split_statements(f"{sql} SELECT 1;"), [sql, "SELECT 1;"]
+        )
+
+    def test_nested_blocks(self):
+        sql = (
+            "CREATE FUNCTION f() BEGIN IF a THEN SELECT 1; END IF; "
+            "CASE WHEN a THEN SELECT 2; END CASE; WHILE b DO SELECT 3; "
+            "END WHILE; END;"
+        )
+        self.assertEqual(
+            sql_tokens.split_statements(f"{sql} SELECT 4;"), [sql, "SELECT 4;"]
+        )
+
+    def test_declare_block(self):
+        sql = "CREATE PROCEDURE p() DECLARE x int; BEGIN SELECT 1; END;"
+        self.assertEqual(sql_tokens.split_statements(sql), [sql])
+
+    def test_begin_transaction_is_not_a_block(self):
+        for begin in ["BEGIN;", "BEGIN TRANSACTION;", "BEGIN IMMEDIATE;"]:
+            with self.subTest(begin=begin):
+                self.assertEqual(
+                    sql_tokens.split_statements(f"{begin} SELECT 1; COMMIT;"),
+                    [begin, "SELECT 1;", "COMMIT;"],
+                )
+
+    def test_hash_comment(self):
+        self.assertEqual(
+            sql_tokens.split_statements("SELECT 1; # a; b\nSELECT 2;"),
+            ["SELECT 1;", "SELECT 2;"],
+        )
+
+    def test_hash_operator_is_not_a_comment(self):
+        sql = "SELECT 1 #2; SELECT 3"
+        self.assertEqual(sql_tokens.split_statements(sql), ["SELECT 1 #2;", "SELECT 3"])
+
+    def test_backslash_escaped_quote(self):
+        sql = "SELECT 'it\\'s;ok'; SELECT 2;"
+        self.assertEqual(
+            sql_tokens.split_statements(sql), ["SELECT 'it\\'s;ok';", "SELECT 2;"]
+        )
+
+    def test_trailing_backslash_in_string(self):
+        self.assertEqual(
+            sql_tokens.split_statements("SELECT 'C:\\'; SELECT 2;"),
+            ["SELECT 'C:\\';", "SELECT 2;"],
+        )
+
+    def test_backslash_in_quoted_name(self):
+        sql = 'CREATE TABLE "a\\" ("b" int); SELECT 1;'
+        self.assertEqual(
+            sql_tokens.split_statements(sql),
+            ['CREATE TABLE "a\\" ("b" int);', "SELECT 1;"],
+        )
+
+    def test_hostile_input_is_fast(self):
+        for sql in ["'" + "a" * 200_000, "$a$ " * 50_000, "[" * 100_000, "(" * 50_000]:
+            with self.subTest(sql=sql[:5]):
+                sql_tokens.split_statements(sql)
+
     def test_empty(self):
         self.assertEqual(sql_tokens.split_statements(" ;; \n"), [";", ";"])
 
