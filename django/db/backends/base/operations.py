@@ -4,11 +4,9 @@ import json
 from importlib import import_module
 from itertools import chain
 
-import sqlparse
-from sqlparse.exceptions import SQLParseError
-
 from django.conf import settings
 from django.db import NotSupportedError, models, transaction
+from django.db.backends import sql_tokens
 from django.db.models import Exists, ExpressionWrapper, Lookup
 from django.db.models.expressions import Col, RawSQL
 from django.db.models.fields.composite import CompositePrimaryKey
@@ -364,11 +362,7 @@ class BaseDatabaseOperations:
         cursor.execute() call and PEP 249 doesn't talk about this use case,
         the default implementation is conservative.
         """
-        return [
-            sqlparse.format(statement, strip_comments=True)
-            for statement in sqlparse.split(sql)
-            if statement
-        ]
+        return sql_tokens.split_statements(sql)
 
     def process_clob(self, value):
         """
@@ -874,11 +868,7 @@ class BaseDatabaseOperations:
 
     def format_debug_sql(self, sql):
         # Hook for backends (e.g. NoSQL) to customize formatting.
-        try:
-            return sqlparse.format(sql, reindent=True, keyword_case="upper")
-        except SQLParseError:
-            # Fallback to unformatted sql.
-            return sql
+        return sql_tokens.format_sql(sql)
 
     def format_json_path_numeric_index(self, num):
         """

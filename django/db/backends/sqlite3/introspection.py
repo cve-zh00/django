@@ -1,8 +1,7 @@
 from collections import namedtuple
 
-import sqlparse
-
 from django.db import DatabaseError
+from django.db.backends import sql_tokens
 from django.db.backends.base.introspection import BaseDatabaseIntrospection
 from django.db.backends.base.introspection import FieldInfo as BaseFieldInfo
 from django.db.backends.base.introspection import TableInfo
@@ -193,32 +192,27 @@ class DatabaseIntrospection(BaseDatabaseIntrospection):
         check_columns = []
         braces_deep = 0
         for token in tokens:
-            if token.match(sqlparse.tokens.Punctuation, "("):
+            if sql_tokens.is_punctuation(token, "("):
                 braces_deep += 1
-            elif token.match(sqlparse.tokens.Punctuation, ")"):
+            elif sql_tokens.is_punctuation(token, ")"):
                 braces_deep -= 1
                 if braces_deep < 0:
                     # End of columns and constraints for table definition.
                     break
-            elif braces_deep == 0 and token.match(sqlparse.tokens.Punctuation, ","):
+            elif braces_deep == 0 and sql_tokens.is_punctuation(token, ","):
                 # End of current column or constraint definition.
                 break
             # Detect column or constraint definition by first token.
             if is_constraint_definition is None:
-                is_constraint_definition = token.match(
-                    sqlparse.tokens.Keyword, "CONSTRAINT"
-                )
+                is_constraint_definition = sql_tokens.is_keyword(token, "CONSTRAINT")
                 if is_constraint_definition:
                     continue
             if is_constraint_definition:
                 # Detect constraint name by second token.
                 if constraint_name is None:
-                    if token.ttype in (sqlparse.tokens.Name, sqlparse.tokens.Keyword):
-                        constraint_name = token.value
-                    elif token.ttype == sqlparse.tokens.Literal.String.Symbol:
-                        constraint_name = token.value[1:-1]
+                    constraint_name = sql_tokens.name_value(token)
                 # Start constraint columns parsing after UNIQUE keyword.
-                if token.match(sqlparse.tokens.Keyword, "UNIQUE"):
+                if sql_tokens.is_keyword(token, "UNIQUE"):
                     unique = True
                     unique_braces_deep = braces_deep
                 elif unique:
@@ -227,21 +221,17 @@ class DatabaseIntrospection(BaseDatabaseIntrospection):
                             # Stop constraint parsing.
                             unique = False
                         continue
-                    if token.ttype in (sqlparse.tokens.Name, sqlparse.tokens.Keyword):
-                        unique_columns.append(token.value)
-                    elif token.ttype == sqlparse.tokens.Literal.String.Symbol:
-                        unique_columns.append(token.value[1:-1])
+                    column = sql_tokens.name_value(token)
+                    if column is not None:
+                        unique_columns.append(column)
             else:
                 # Detect field name by first token.
                 if field_name is None:
-                    if token.ttype in (sqlparse.tokens.Name, sqlparse.tokens.Keyword):
-                        field_name = token.value
-                    elif token.ttype == sqlparse.tokens.Literal.String.Symbol:
-                        field_name = token.value[1:-1]
-                if token.match(sqlparse.tokens.Keyword, "UNIQUE"):
+                    field_name = sql_tokens.name_value(token)
+                if sql_tokens.is_keyword(token, "UNIQUE"):
                     unique_columns = [field_name]
             # Start constraint columns parsing after CHECK keyword.
-            if token.match(sqlparse.tokens.Keyword, "CHECK"):
+            if sql_tokens.is_keyword(token, "CHECK"):
                 check = True
                 check_braces_deep = braces_deep
             elif check:
@@ -250,12 +240,9 @@ class DatabaseIntrospection(BaseDatabaseIntrospection):
                         # Stop constraint parsing.
                         check = False
                     continue
-                if token.ttype in (sqlparse.tokens.Name, sqlparse.tokens.Keyword):
-                    if token.value in columns:
-                        check_columns.append(token.value)
-                elif token.ttype == sqlparse.tokens.Literal.String.Symbol:
-                    if token.value[1:-1] in columns:
-                        check_columns.append(token.value[1:-1])
+                column = sql_tokens.name_value(token)
+                if column in columns:
+                    check_columns.append(column)
         unique_constraint = (
             {
                 "unique": True,
@@ -285,13 +272,12 @@ class DatabaseIntrospection(BaseDatabaseIntrospection):
     def _parse_table_constraints(self, sql, columns):
         # Check constraint parsing is based of SQLite syntax diagram.
         # https://www.sqlite.org/syntaxdiagrams.html#table-constraint
-        statement = sqlparse.parse(sql)[0]
         constraints = {}
         unnamed_constrains_index = 0
-        tokens = (token for token in statement.flatten() if not token.is_whitespace)
+        tokens = sql_tokens.significant_tokens(sql)
         # Go to columns and constraint definition
         for token in tokens:
-            if token.match(sqlparse.tokens.Punctuation, "("):
+            if sql_tokens.is_punctuation(token, "("):
                 break
         # Parse columns and constraint definition
         while True:
@@ -317,7 +303,7 @@ class DatabaseIntrospection(BaseDatabaseIntrospection):
                     constraints[
                         "__unnamed_constraint_%s__" % unnamed_constrains_index
                     ] = check
-            if end_token.match(sqlparse.tokens.Punctuation, ")"):
+            if sql_tokens.is_punctuation(end_token, ")"):
                 break
         return constraints
 
@@ -421,11 +407,10 @@ class DatabaseIntrospection(BaseDatabaseIntrospection):
         return constraints
 
     def _get_index_columns_orders(self, sql):
-        tokens = sqlparse.parse(sql)[0]
-        for token in tokens:
-            if isinstance(token, sqlparse.sql.Parenthesis):
-                columns = str(token).strip("()").split(", ")
-                return ["DESC" if info.endswith("DESC") else "ASC" for info in columns]
+        groups = sql_tokens.parenthesized_groups(sql)
+        if groups:
+            columns = groups[0].split(", ")
+            return ["DESC" if info.endswith("DESC") else "ASC" for info in columns]
         return None
 
     def _get_column_collations(self, cursor, table_name):
@@ -441,7 +426,10 @@ class DatabaseIntrospection(BaseDatabaseIntrospection):
             return {}
 
         sql = row[0]
-        columns = str(sqlparse.parse(sql)[0][-1]).strip("()").split(", ")
+        groups = sql_tokens.parenthesized_groups(sql)
+        if not groups:
+            return {}
+        columns = groups[-1].split(", ")
         collations = {}
         for column in columns:
             tokens = column[1:].split()
